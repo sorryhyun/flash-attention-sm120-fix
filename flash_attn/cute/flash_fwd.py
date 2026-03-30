@@ -649,7 +649,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # SM120 (Blackwell GeForce) uses SM80 MMA and does not support SM90 TMA O-store
+        self.use_tma_O = self.arch >= Arch.sm_90 and self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]

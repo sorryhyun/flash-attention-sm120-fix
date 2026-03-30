@@ -1026,6 +1026,7 @@ def _flash_attn_bwd(
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
+        dQ_single_wg = False
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local)
         m_block_size = cfg.m_block_size
