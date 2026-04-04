@@ -1004,21 +1004,24 @@ def _flash_attn_bwd(
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
-        m_block_size = 64
-        n_block_size = 64
+        # Tuned defaults from Phase 1 sweep (RTX 5060 Ti, D=64):
+        #   stg=3,1 atom=2,1,4 → ~8.8% backward speedup vs original stg=2,2 atom=4,4,4.
+        # All config values are overridable via FA4_SM120_BWD_* env vars.
+        m_block_size = int(os.environ.get("FA4_SM120_BWD_BLOCK_M", "64"))
+        n_block_size = int(os.environ.get("FA4_SM120_BWD_BLOCK_N", "64"))
         if head_dim <= 64:
-            num_stages_Q = 2
-            num_stages_dO = 2
+            num_stages_Q = int(os.environ.get("FA4_SM120_BWD_STAGES_Q", "3"))
+            num_stages_dO = int(os.environ.get("FA4_SM120_BWD_STAGES_DO", "1"))
         else:
-            num_stages_Q = 1
-            num_stages_dO = 1
-        SdP_swapAB = False
-        dKV_swapAB = False
-        dQ_swapAB = False
-        AtomLayoutMSdP = 4
-        AtomLayoutNdKV = 4
-        AtomLayoutMdQ = 4
-        V_in_regs = False
+            num_stages_Q = int(os.environ.get("FA4_SM120_BWD_STAGES_Q", "1"))
+            num_stages_dO = int(os.environ.get("FA4_SM120_BWD_STAGES_DO", "1"))
+        SdP_swapAB = os.environ.get("FA4_SM120_BWD_SDP_SWAPAB", "0") == "1"
+        dKV_swapAB = os.environ.get("FA4_SM120_BWD_DKV_SWAPAB", "0") == "1"
+        dQ_swapAB = os.environ.get("FA4_SM120_BWD_DQ_SWAPAB", "0") == "1"
+        AtomLayoutMSdP = int(os.environ.get("FA4_SM120_BWD_ATOM_MSDP", "2"))
+        AtomLayoutNdKV = int(os.environ.get("FA4_SM120_BWD_ATOM_NDKV", "1"))
+        AtomLayoutMdQ = int(os.environ.get("FA4_SM120_BWD_ATOM_MDQ", "4"))
+        V_in_regs = os.environ.get("FA4_SM120_BWD_V_IN_REGS", "0") == "1"
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
