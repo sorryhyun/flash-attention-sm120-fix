@@ -744,7 +744,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                num_stages=int(os.environ.get("FA4_SM120_FWD_STAGES", "1")),
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
