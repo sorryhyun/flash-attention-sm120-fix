@@ -54,7 +54,6 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn.cute.flash_fwd_sm120_tma_optimized import FlashAttentionForwardSm120TMAOptimized
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -452,12 +451,9 @@ def _flash_attn_fwd(
     # In fake mode (CPU-only compilation), use a fake stream placeholder.
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # SM80: 4 MMA warps (128 threads)
-    # SM120 forward: 1 DMA warp + 4 MMA warps (160 threads) for TMA kernel
-    if arch // 10 == 8:
+    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
+    if arch // 10 in [8, 12]:
         num_threads = 128
-    elif arch // 10 == 12:
-        num_threads = 160
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
@@ -734,66 +730,27 @@ def _flash_attn_fwd(
                 use_2cta_instrs=use_2cta_instrs,
             )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): TMA-optimized forward kernel.
-            # Uses 1 DMA warp + 4 MMA warps (160 threads), TMA for Q/K/V/O,
-            # shared KV SMEM with stage-offset interleaving, Q/O buffer aliasing.
+            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            # TMA kernel benefits from triple-buffering: the dedicated DMA warp
-            # prefetches KV tiles while MMA warps consume the current one.
-            _sm120_fwd_stages = 3
-            _sm120_tma_ok = FlashAttentionForwardSm120TMAOptimized.can_implement(
-                dtype, head_dim, head_dim_v, tile_m, tile_n,
-                _sm120_fwd_stages, num_threads, causal,
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
             )
-            if not _sm120_tma_ok:
-                _sm120_fwd_stages = 2
-                _sm120_tma_ok = FlashAttentionForwardSm120TMAOptimized.can_implement(
-                    dtype, head_dim, head_dim_v, tile_m, tile_n,
-                    _sm120_fwd_stages, num_threads, causal,
-                )
-            if _sm120_tma_ok:
-                fa_fwd = FlashAttentionForwardSm120TMAOptimized(
-                    dtype,
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    pack_gqa=pack_gqa,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    num_stages=_sm120_fwd_stages,
-                    num_threads=num_threads,
-                    use_tma_Q=True,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                )
-            else:
-                # Fallback to simple SM120 kernel (cp.async, 128 threads)
-                num_threads = 128
-                _sm120_fwd_stages = 2 if FlashAttentionForwardSm120.can_implement(
-                    dtype, head_dim, head_dim_v, tile_m, tile_n, 2, num_threads, causal
-                ) else 1
-                fa_fwd = FlashAttentionForwardSm120(
-                    dtype,
-                    head_dim,
-                    head_dim_v,
-                    qhead_per_kvhead,
-                    is_causal=causal,
-                    is_local=local,
-                    pack_gqa=pack_gqa,
-                    tile_m=tile_m,
-                    tile_n=tile_n,
-                    num_stages=_sm120_fwd_stages,
-                    num_threads=num_threads,
-                    Q_in_regs=False,
-                    score_mod=score_mod,
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
