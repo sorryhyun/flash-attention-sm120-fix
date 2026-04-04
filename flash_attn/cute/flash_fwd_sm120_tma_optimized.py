@@ -17,7 +17,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Constexpr, Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
-from cutlass.cute.arch import ProxyKind, SharedSpace
 import cutlass.utils as utils_basic
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -1832,7 +1831,7 @@ class FlashAttentionForwardSm120TMAOptimized(FlashAttentionForwardSm80):
             )
             mO_cur = cute.domain_offset((offset, 0), mO_base)
         if const_expr(tma_atom_O is not None and not self.pack_gqa and not self.check_hdim_v_oob):
-            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier_arrive(
                 barrier_id=int(NamedBarrierFwd.Epilogue),
                 number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE,
@@ -1899,13 +1898,9 @@ class FlashAttentionForwardSm120TMAOptimized(FlashAttentionForwardSm80):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
-        smem_copy_atom_O = cute.make_copy_atom(
-            warp.StMatrix8x8x16bOp(
-                transpose=False,  # ROW_MAJOR
-                num_matrices=4,
-            ),
-            self.dtype,
-        )
+        # SM120 uses SM80 MMA (mma.sync) whose register layout is incompatible
+        # with stmatrix.sync (SM90+). Use CopyUniversalOp via get_smem_store_atom.
+        smem_copy_atom_O = utils.get_smem_store_atom(120, self.dtype)
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
