@@ -12,6 +12,7 @@ from cutlass import Float32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir import ir
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -392,7 +393,7 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
     nvvm.atomicrmw(
-        nvvm.AtomicOpKind.FADD, gmem_ptr.llvm_ptr, Float32(a).ir_value()
+        ir.F32Type.get(), nvvm.AtomicOpKind.FADD, gmem_ptr.llvm_ptr, Float32(a).ir_value()
     )
 
 
