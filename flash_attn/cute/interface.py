@@ -1740,6 +1740,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 20)
 
 
+@torch.compiler.disable
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1782,6 +1783,7 @@ def flash_attn_func(
     )
 
 
+@torch.compiler.disable
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
