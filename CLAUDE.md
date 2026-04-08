@@ -4,19 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90) and Blackwell (SM100/SM110) GPUs. Package name: `flash-attn-4`.
+FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels written in Python using CuTeDSL (NVIDIA CUTLASS DSL). Kernels are compiled to PTX/CUBIN at runtime. Targets Hopper (SM90), Blackwell datacenter (SM100/SM110), and Blackwell GeForce / DGX Spark (SM120) GPUs. Package name: `flash-attn-4`.
+
+This fork adds SM120 support. SM120 GPUs use SM80-era `mma.sync.aligned.m16n8k16` MMA instructions (no warpgroup MMA, no hardware TMA for output) but have reduced shared memory (99 KB vs 163 KB on SM80). The SM120 kernels subclass the SM80 base classes with SMEM capacity overrides and architecture-specific fixups.
 
 The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
 
 ## Build & Install
 
 ```bash
-pip install flash-attn-4
+uv pip install flash-attn-4
 # or dev install:
-pip install -e "flash_attn/cute[dev]"
+uv pip install -e "flash_attn/cute[dev]"
 ```
 
-Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+Dependencies: `nvidia-cutlass-dsl>=4.4.2`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
 
 ## Running Tests
 
@@ -27,6 +29,9 @@ pytest tests/cute/test_flash_attn_varlen.py
 pytest tests/cute/test_mask_mod.py
 pytest tests/cute/test_score_mod.py
 pytest tests/cute/test_block_sparsity.py
+
+# SM120 quick sanity check (forward + backward vs PyTorch reference)
+python test_sm120_nan.py
 ```
 
 ### Fast two-pass testing
@@ -43,7 +48,7 @@ FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x
 
 - `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
 - `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
-- `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
+- `-n 64` — pytest-xdist parallel workers (only useful in the compilation pass).
 
 Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.
 
@@ -63,8 +68,10 @@ ruff format flash_attn/cute/
 ### Public API (`flash_attn/cute/interface.py`)
 
 Two entry points exported from `flash_attn/cute/__init__.py`:
-- `flash_attn_func(q, k, v, ...)` — standard attention
+- `flash_attn_func(q, k, v, ...)` — standard attention (returns `(out, lse)` tuple)
 - `flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)` — variable-length
+
+Both are decorated with `@torch.compiler.disable` to prevent torch.compile/dynamo from tracing CuTeDSL kernel construction (which triggers excessive recompilation guards on `arith.const()` scalar values).
 
 Key parameters: `causal`, `window_size_left/right`, `softmax_scale`, `softcap`, `score_mod`, `mask_mod`, `block_sparse_tensors`, `num_splits`, `pack_gqa`, `m_block_size`, `n_block_size`, `num_threads`.
 
@@ -72,15 +79,18 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 
 ### Forward Kernels
 
-- `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
-- `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
+- `flash_fwd.py` — `FlashAttentionForwardSm80` (base) / `FlashAttentionForwardSm90` (Hopper). No SplitKV or paged KV.
+- `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell datacenter forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
+- `flash_fwd_sm120.py` — `FlashAttentionForwardSm120`: Blackwell GeForce forward. Subclasses SM80 with 99 KB SMEM cap. Sets `arch = 80` to use CpAsync paths (no TMA for O).
+- `flash_fwd_sm120_tma_optimized.py` — Experimental TMA-optimized SM120 forward with persistent scheduling (currently not wired into `interface.py`).
 - `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
 
 ### Backward Kernels
 
 - `flash_bwd.py` — `FlashAttentionBackwardSm80`: Ampere backward (base).
 - `flash_bwd_sm90.py` — `FlashAttentionBackwardSm90`: Hopper backward.
-- `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell backward with 2CTA and block sparse support.
+- `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell datacenter backward with 2CTA and block sparse support.
+- `flash_bwd_sm120.py` — `FlashAttentionBackwardSm120`: Blackwell GeForce backward. Subclasses SM80 with 99 KB SMEM cap.
 - `flash_bwd_preprocess.py` / `flash_bwd_postprocess.py` — auxiliary backward kernels.
 
 ### Core Abstractions
@@ -114,6 +124,20 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
 
 Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
+
+## SM120 Critical Invariants
+
+### No TMA for output epilogue
+
+SM120 reports `arch >= SM90` at runtime but uses SM80 MMA instructions. The output TMA epilogue path (`use_tma_O`) must be disabled: `self.use_tma_O = self.arch >= Arch.sm_90 and self.arch < Arch.sm_120`. The SM120 forward class sets `arch = 80` to route to CpAsync paths instead.
+
+### No stmatrix for SM80 MMA register layout
+
+`utils.get_smem_store_atom` selects `StMatrix8x8x16bOp` (`stmatrix.sync.aligned`) for `arch >= 90`. SM120 passes this check but its SM80 MMA output register layout is incompatible with stmatrix's thread-to-shared-memory mapping, causing silent data corruption (NaN loss). Fix: `arch < 90 or arch >= 120` excludes SM120 from the stmatrix path.
+
+### Backward config defaults
+
+SM120 backward uses `dQ_single_wg = False` (consistent with SM80). Tile sizes and atom layouts are tuned for RTX 5060 Ti (stg=3,1 atom=2,1,4). All backward config values are overridable via `FA4_SM120_BWD_*` env vars for further tuning without code changes.
 
 ## Key Patterns
 

@@ -1,84 +1,71 @@
-# Flash Attention 4: SM120 (Blackwell GeForce) Bugs
+# pack_gqa `crd2idx` rank mismatch with CUTLASS DSL >= 4.5
+
+## Summary
+
+`nvidia-cutlass-dsl==4.5.0.dev0` introduces stricter layout coalescing in CuTe. When a hierarchical layout like `(qhead_per_kvhead, seqlen_q):(stride_h, stride_m)` is contiguous (i.e., `stride_h * qhead_per_kvhead == stride_m`), CuTe 4.5 coalesces it into a flat layout `(N):(stride_h)`. The existing `pack_gqa.py` code then passes hierarchical coordinates `((h_idx, m_idx),)` to `crd2idx`, which rejects the rank mismatch.
+
+## Error
+
+```
+error: unable to compute crd2idx with '!cute.layout<"(?):(1)">' and '!cute.coord<"((?,?))">'
+```
+
+at `pack_gqa.py` line 140 (and 3 other call sites with the same pattern).
+
+## Root cause
+
+`pack_gqa_layout()` creates a tensor with mode 0 = `(qhead_per_kvhead, seqlen_q):(head_stride, seqlen_stride)`. When this sub-layout is contiguous, CuTe 4.5 coalesces it to a single flat mode. The coordinate `((h_idx, m_idx),)` then has rank 2 but the layout has rank 1.
+
+### When does coalescing happen?
+
+The packed mode-0 strides are `(head_stride, seqlen_stride)` where `head_stride = T.stride[head_idx]` and `seqlen_stride = T.stride[0]`. Coalescing happens when `head_stride * qhead_per_kvhead == seqlen_stride`:
+
+- **MHA** (`qhead_per_kvhead=1`): Always coalesces — size-1 mode is trivially contiguous.
+- **MQA** (`qhead_per_kvhead=nheads`): Coalesces because `head_stride * nheads == seqlen_stride` for standard `(batch, seqlen, nheads, headdim)` layout.
+- **GQA** (`1 < qhead_per_kvhead < nheads`): Does NOT coalesce because `head_stride * qhead_per_kvhead < seqlen_stride` (stride gap from non-adjacent heads).
+
+### What triggers it?
+
+All 4 call sites in `pack_gqa.py` that use `elem_pointer(tensor, ((h_idx, m_idx),))`:
+
+1. `compute_ptr()` — called with `mQ[None, 0]` and `mO[None, 0]` (sliced tensors lose hierarchy)
+2. `load_Q()` else branch — inline `elem_pointer(mQ_ptr_base, ((h_idx, m_idx),))`
+3. `store_LSE()` else branch — `elem_pointer(mLSE, ((h_idx, m_idx),))`
+4. `store_O()` else branch — inline `elem_pointer(mO_ptr_base, ((h_idx, m_idx),))`
+
+The `[None, 0]` slicing (takes mode 0 at headdim=0) produces a tensor whose only mode is the packed `(qh, sq)` layout — which gets coalesced.
+
+## What we tried
+
+1. **Scalar flat index `crd2idx(idx, layout)`**: Compiles, but gives wrong pointer offsets. The coalesced layout `(N):(1)` has lost the physical stride, so `idx * 1 != h_idx * head_stride + m_idx * seqlen_stride`.
+
+2. **Pass full 2D tensor with `((h_idx, m_idx), 0)` coord**: Also fails — CuTe 4.5 coalesces mode 0 even within the 2D tensor, producing layout `(?):(1)` and rejecting `((?,?),0)`.
+
+3. **Constexpr branch `qhead_per_kvhead == 1`**: Only fixes MHA, not MQA.
+
+## Likely fix directions
+
+- **Reconstruct the layout explicitly**: After `[None, 0]` slicing, wrap the result in `cute.make_tensor(ptr, cute.make_layout((qh, sq), stride=(head_stride, seqlen_stride)))` using the known strides. This preserves the hierarchy.
+
+- **Manual pointer arithmetic**: Skip `crd2idx` entirely. Compute `ptr + h_idx * head_stride + m_idx * seqlen_stride` directly. Requires passing the strides as parameters (they're available from the original tensor before slicing).
+
+- **Prevent coalescing upstream**: Check if CuTe DSL 4.5 has an API to create "non-coalescable" layouts, or if `make_layout` has a flag to preserve hierarchy.
+
+## Affected configurations
+
+- MHA with `pack_gqa=True` or `pack_gqa=None` (MHA enables pack_gqa by default when num_splits > 1)
+- MQA with any `pack_gqa` setting
+- GQA is NOT affected (non-contiguous strides prevent coalescing)
+
+## Reproduction
+
+```bash
+uv pip install --prerelease=allow 'nvidia-cutlass-dsl==4.5.0.dev0'
+FLASH_ATTENTION_DISABLE_SPLIT=TRUE pytest tests/cute/test_flash_attn.py::test_flash_attn_output -x -k "64-False-0-0.0-False-False-False-mqa"
+```
 
 ## Environment
 
-- GPU: NVIDIA GeForce RTX 5060 Ti (SM 12.0)
-- CUDA: 13.0
-- PyTorch: 2.11.0+cu130
-- flash-attn-4: 4.0.0b6.dev10 (original) / sisgrad fork `dz/sm120_tma_optimized`
-- nvidia-cutlass-dsl: 4.4.2
-- quack-kernels: 0.3.7
-
-## Bug 1: Forward pass — TMA O-store crash (`flash_fwd.py`)
-
-### Symptom
-
-```
-File "flash_attn/cute/flash_fwd.py", line 399, in epilogue
-    store_O, _, _ = copy_utils.tma_get_copy_fn(
-        tma_atom_O, 0, cute.make_layout(1), sO, gO, single_stage=True
-    )
-File "quack/copy_utils.py", line 775, in tma_get_copy_fn
-    s, g = cpasync.tma_partition(atom, ...)
-File "nvidia_cutlass_dsl/.../helpers.py", line 209, in tma_partition
-    atom._trait.value,
-AttributeError: 'NoneType' object has no attribute '_trait'
-```
-
-### Root cause
-
-`flash_fwd.py` line 652:
-
-```python
-self.use_tma_O = self.arch >= Arch.sm_90
-```
-
-SM120 is >= SM90, so `use_tma_O = True`. But SM120 uses SM80 MMA instructions and the CuTe TMA descriptor for the O epilogue is not initialized for this architecture — `atom._trait` is `None`.
-
-Note: `FlashAttentionForwardSm120` sets `arch = 80` as a class attribute, but the parent `__init__` (`FlashAttentionForwardSm80.__init__`) overwrites it at line 110:
-
-```python
-self.arch = BaseDSL._get_dsl().get_arch_enum()  # returns SM 12.0 at runtime
-```
-
-So the class-level `arch = 80` override in `flash_fwd_sm120.py` has no effect on `use_tma_O`.
-
-### Fix
-
-```python
-# flash_fwd.py line 652
-self.use_tma_O = self.arch >= Arch.sm_90 and self.arch < Arch.sm_120
-```
-
-## Bug 2: Backward pass — `dQ_single_wg` unbound (`interface.py`)
-
-### Symptom
-
-```
-File "flash_attn/cute/interface.py", line 1321, in _flash_attn_bwd
-    dQ_single_wg,
-UnboundLocalError: cannot access local variable 'dQ_single_wg' where it is not associated with a value
-```
-
-### Root cause
-
-In `_flash_attn_bwd`, the SM120 config block (lines 1005-1028) sets tile sizes, swap flags, atom layouts, and `V_in_regs`, but does not set `dQ_single_wg`. The compile_key tuple for `arch // 10 in [8, 9, 12]` (line 1297) references `dQ_single_wg`, causing `UnboundLocalError`.
-
-### Fix
-
-Add `dQ_single_wg = False` to the SM120 block (consistent with SM80 backward which uses a single warp group):
-
-```python
-# interface.py, after line 1028
-        dQ_single_wg = False
-```
-
-## Bug 3 (API change): `flash_attn_func` now returns `(out, lse)` tuple
-
-The updated `flash_attn_func` / `FlashAttnFunc.apply` always returns `(out, lse)` regardless of `return_lse`. Callers expecting a single tensor will get `AttributeError: 'tuple' object has no attribute 'reshape'`.
-
-This is not strictly a bug in flash-attn-4 but a breaking API change from the previous version where only the output tensor was returned.
-
-## Fix commit
-
-https://github.com/sorryhyun/flash-attention-sm120-fix/tree/dz/sm120_tma_optimized
+- `nvidia-cutlass-dsl==4.5.0.dev0` (works on `4.4.2`)
+- CUDA 13.0, PyTorch 2.11
+- SM120 (RTX 5060 Ti), but issue is architecture-independent — affects SM80/SM90/SM100 pack_gqa paths too
