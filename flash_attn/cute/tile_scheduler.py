@@ -196,11 +196,13 @@ class StaticPersistentTileScheduler:
     def get_grid_shape(
         params: Params,
         *,
+        sm_count: Optional[int] = None,
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        hardware_info = cutlass.utils.HardwareInfo()
-        sm_count = hardware_info.get_device_multiprocessor_count()
+        if sm_count is None:
+            hardware_info = cutlass.utils.HardwareInfo()
+            sm_count = hardware_info.get_device_multiprocessor_count()
         # Grid must be a multiple of cluster_shape_m for CUDA cluster launch.
         max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
         grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)

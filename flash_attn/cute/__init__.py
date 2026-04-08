@@ -13,6 +13,7 @@ from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
+from .green_context import GreenContext
 
 from flash_attn.cute.cute_dsl_utils import cute_compile_patched
 
@@ -23,4 +24,5 @@ cute.compile = cute_compile_patched
 __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
+    "GreenContext",
 ]

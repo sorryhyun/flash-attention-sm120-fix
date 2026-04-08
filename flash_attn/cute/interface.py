@@ -21,6 +21,7 @@
 
 import os
 import math
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
@@ -96,6 +97,17 @@ def _get_device_arch():
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + int(minor)
+
+
+def _pack_gqa_supported(arch: int) -> bool:
+    """pack_gqa requires TMA-based Q/O paths (SM90+, excluding SM120).
+
+    The SM80 base forward epilogue calls PackGQA.store_O/store_LSE which use
+    elem_pointer with nested coordinates — these fail crd2idx in the MLIR IR.
+    SM90/SM100/SM110 avoid this via TMA-based epilogues.
+    SM120 subclasses SM80 and inherits the broken non-TMA path.
+    """
+    return arch // 10 in [9, 10, 11]
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
@@ -418,6 +430,8 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if pack_gqa and not _pack_gqa_supported(arch):
+        pack_gqa = False
 
     out_torch_dtype = q.dtype
     device = q.device
